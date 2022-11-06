@@ -1,0 +1,1 @@
+sbatch run_multinode_2_2.slrm ~/projects/simple_lm/simple_lm/scripts/workspaces/workspace slurm_example_gtc.py ~/projects/simple_lm/simple_lm/scripts/logs
