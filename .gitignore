@@ -2,3 +2,4 @@ workspace_*
 logs
 *.mypy_cache/
 *.swp
+__pycache___/
