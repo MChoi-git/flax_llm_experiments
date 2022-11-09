@@ -1,13 +1,25 @@
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional, Callable, Tuple, Union
 
+import einops
+import numpy as np
 import jax
 from jax import numpy as jnp
 import flax.linen as nn
+import flax.linen.initializers as nn_initializers
 from flax.linen.dtypes import promote_dtype
 import flax.linen.partitioning as nn_partitioning
 
 from partitioning import with_sharding_constraint
+
+
+"""
+NN transformer layer implementations. Some code taken from the T5x repo
+(https://github.com/google-research/t5x/tree/1d3ebe5e8aed098d986694479ac864380273338a)
+and flax (https://github.com/google/flax). This code is solely for pedagogical
+purposes.
+"""
 
 
 Dtype = Any
@@ -25,6 +37,105 @@ def default_attn_norm(x: jnp.ndarray, hidden_dim: int):
 
 def _normalize_axes(axes, ndim):
     return tuple([ax if ax >= 0 else ndim + ax for ax in axes])
+
+
+def _fixed_pos_embed(x, seq_dim=1):
+    """
+    Sequence dimension alternates sin and cosine as well as their frequency in
+    an increasing scheme. The hidden dimension is the wave function for the
+    specific sinusoid function defined in the specific sequence position.
+    """
+    dim = x.shape[-1]
+
+    # Hidden axis
+    inv_freq = 1. / (10000 ** (np.arange(0, dim, 2) / dim))
+
+    # Sequence axis
+    sinusoid_inp = np.einsum("i,j->ij", np.arange(x.shape[seq_dim]), inv_freq)
+
+    return np.sin(sinusoid_inp), np.cos(sinusoid_inp)
+
+
+def _rotate_every_two(x):
+    """
+    Return the interleaved vector for the sin addition. Ie. Something like
+    [-1, 0, -3, 2, -5, 4, ...], where the integers are the indices of the
+    elements in the input vector.
+    """
+    # Separate evens and odds
+    evens = x[:, ::2, :, :]
+    odds = x[:, 1::2, :, :]
+
+    # Stack and flatten
+    x = jnp.stack((-odds, evens), axis=1)
+
+    return einops.rearrange(x, "b d j ... -> b (d j) ...")
+
+
+def apply_rotary_pos_embed(x: jnp.ndarray, seq_dim: int):
+    """
+    Applies RoPE to a tensor x. See:
+        `https://blog.eleuther.ai/rotary-embeddings/` and
+        `https://arxiv.org/pdf/2104.09864v2.pdf` (RoPE paper)
+        for more details.
+    Splits each d-dimensional hidden vector in a sequence into d/2 pairs. Each
+    pair defines a vector in 2-D space. Each pair has an associated angle
+    theta, defining a 2-D rotation. Theta is sourced from a schedule, which
+    is a hyperparameter. Each pair also has a magnitude m, which is equivalent
+    to the pair's position in the hidden vector, from [0, (d-1)/2]. This
+    magnitude defines how much to scale its respective pair's theta parameter
+    by. This pair-wise vector rotation (about the origin) is repeated for all
+    d/2 pairs in the hidden vector, which is then done again for each position
+    in the sequence.
+
+    Example:
+        For hidden vectors of length d:
+        h1 = [1, 5, 23, 7, ...]
+            -> rotate([1, 5], angle=theta1 * 1)
+            -> rotate([23, 7], angle=theta2 * 1)
+            -> ...
+        h2 = [6, 3, 7, 2, ...]
+            -> rotate([6, 3], angle=theta1 * 2)
+            -> rotate([7, 2], angle=theta2 * 2)
+            -> ...
+        theta_schedule = {10000 ** (-2i/d)|i in [0, 1, 2, ..., (d-1)/2]}
+        rotate = dot(2d_rotation_matrix, x)
+    """
+    sincos = _fixed_pos_embed(x, seq_dim=seq_dim)
+
+    sin, cos = map(
+        lambda t: einops.repeat(
+            t, "b n -> b (n j)", j=2)[-x.shape[-3]:, None, :], sincos)
+    return (x * cos) + (_rotate_every_two(x) * sin)
+
+
+@dataclass
+class TransformerConfig:
+    num_layers: int = 16
+    vocab_size: int = 50000
+
+    hidden_dim: int = 8
+    num_heads: int = 2
+    mlp_hidden_multiplier: int = 4
+
+    qkv_dropout: float = 0.1
+    msa_dropout: float = 0.1
+    mlp_dropout: float = 0.1
+
+    nonlin_fn: Callable = jax.nn.gelu
+
+    dtype: Dtype = jnp.float32
+    param_dtype: Dtype = jnp.float32
+
+    embedding_init: Callable = nn_initializers.variance_scaling(
+        1.0, "fan_in", "normal", out_axis=0)
+    kernel_init: Callable = jax.nn.initializers.lecun_normal()
+    bias_init: Callable = jax.nn.initializers.zeros
+    ln_scale_init: Optional[Callable] = jax.nn.initializers.ones
+    attn_norm_fn: Callable = default_attn_norm
+
+    use_scan: bool = True
+    use_shared_vocab_embed: bool = True
 
 
 class Dense(nn.Module):
@@ -99,9 +210,6 @@ class MultiheadAttention(nn.Module):
     bias_init: Callable = jax.nn.initializers.zeros
 
     attn_norm_fn: Callable = default_attn_norm
-    attn_mask_fn: Callable = make_causal_mask
-
-    named_axes: Tuple[str, ...] = ("embed", "kv")
 
     @nn.compact
     def __call__(self, inputs: jnp.ndarray, mask: jnp.ndarray, train: bool):
@@ -137,8 +245,14 @@ class MultiheadAttention(nn.Module):
         k = with_sharding_constraint(k, ("batch", "seq", "heads", "kv"))
         v = with_sharding_constraint(v, ("batch", "seq", "heads", "kv"))
 
+        # TODO: Additional sharding constraints here may not be necessary
+        q = apply_rotary_pos_embed(q, seq_dim=1)
+        q = with_sharding_constraint(q, ("batch", "seq", "heads", "kv"))
+        k = apply_rotary_pos_embed(k, seq_dim=1)
+        k = with_sharding_constraint(k, ("batch", "seq", "heads", "kv"))
+
         dropout_rng = (
-            self.make_rng("dropout") if train and self.qkv_dropout < 0.0 else None
+            self.make_rng("dropout") if train and self.qkv_dropout > 0.0 else None
         )
 
         self_attn = dot_product_attention(
@@ -191,30 +305,59 @@ class LayerNorm(nn.Module):
         return y * scale
 
 
+class Embed(nn.Module):
+    num_embeddings: int
+    hidden_dim: int
+    dtype: Optional[Dtype] = None
+    param_dtype: Optional[Dtype] = jnp.float32
+    embedding_init: Callable = nn_initializers.variance_scaling(
+        1.0, "fan_in", "normal", out_axis=0)
+
+    def setup(self):
+        self.embedding = nn_partitioning.param_with_axes(
+            "embedding",
+            self.embedding_init,
+            (self.num_embeddings, self.hidden_dim),
+            self.param_dtype,
+            axes=("vocab", "embed"))
+
+    def __call__(self, inputs: jnp.ndarray):
+        if not jnp.issubdtype(inputs, jnp.integer):
+            raise ValueError("Input type must be an integer type")
+
+        embedding = promote_dtype(
+            self.embedding, dtype=self.dtype, inexact=False)
+
+        return jnp.take(embedding, inputs, axis=0)
+
+    def attend(self, inputs: jnp.ndarray):
+        inputs, embedding = promote_dtype(
+            inputs, self.embedding, dtype=self.dtype)
+
+        return jnp.dot(inputs, embedding.T)
+
+
 class DecoderLayer(nn.Module):
     hidden_dim: int
     num_heads: int
     mlp_hidden_multiplier: int
-
     qkv_dropout: float
     msa_dropout: float
     mlp_dropout: float
-
-    nonlin_fn: Callable = jax.nn.gelu
-
-    param_dtype: Optional[Dtype] = jnp.float32
-    dtype: Optional[Dtype] = jnp.float32
-
-    kernel_init: Callable = jax.nn.initializers.lecun_normal()
-    bias_init: Callable = jax.nn.initializers.zeros
-
-    ln_scale_init: Optional[Callable] = jax.nn.initializers.ones
-
-    attn_norm_fn: Callable = default_attn_norm
-    attn_mask_fn: Callable = make_causal_mask
+    dtype: Dtype
+    param_dtype: Dtype
+    attn_norm_fn: Callable
+    use_scan: bool
+    embedding_init: Callable
+    kernel_init: Callable
+    bias_init: Callable
+    ln_scale_init: Callable
 
     @nn.compact
-    def __call__(self, inputs: jnp.ndarray, train: bool):
+    def __call__(self,
+                 inputs: jnp.ndarray,
+                 decoder_mask: jnp.ndarray,
+                 train: bool):
         """
         Note: The f and g functions for tensor and sequence parallel are
         included at the last layer they are present in.
@@ -234,18 +377,14 @@ class DecoderLayer(nn.Module):
         ln1_out = with_sharding_constraint(ln1_out, ("batch", "seq", "embed"))
         # (None, None, None)
 
-        # TODO: Implement fn to get mask
-        mask = jnp.zeros(1)
-
         # (None, None, None)
         multihead_out = MultiheadAttention(
             hidden_dim=self.hidden_dim,
             num_heads=self.num_heads,
             qkv_dropout=self.qkv_dropout,
             dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            named_axes=("embed", "kv"),
-        )(ln1_out, mask, train)
+            param_dtype=self.param_dtype
+        )(ln1_out, decoder_mask, train)
         # (None, None, None)
 
         # (None, "mp", None)
@@ -306,7 +445,161 @@ class DecoderLayer(nn.Module):
         # (None, "mp", None)
 
         # (None, "mp", None)
-        layer_output = mlp_dropout + mlp_residual
+        outputs = mlp_dropout + mlp_residual
         # (None, "mp", None)
 
-        return layer_output
+        if self.use_scan:
+            return outputs, None
+
+        else:
+            return outputs
+
+
+class Decoder(nn.Module):
+    num_layers: int
+    hidden_dim: int
+    num_heads: int
+    mlp_hidden_multiplier: int
+    vocab_size: int
+    qkv_dropout: float
+    msa_dropout: float
+    mlp_dropout: float
+    dtype: Dtype
+    param_dtype: Dtype
+    attn_norm_fn: Callable
+    use_scan: bool
+    embedding_init: Callable
+    kernel_init: Callable
+    bias_init: Callable
+    ln_scale_init: Callable
+    shared_embed: Optional[nn.Module] = None
+
+    @nn.compact
+    def __call__(self,
+                 inputs: jnp.ndarray,
+                 decoder_mask: jnp.ndarray,
+                 train: bool):
+        # ("batch", "seq", "embed")
+
+        # Run through core decoder layers with or w/o scan
+        if self.use_scan:
+            scan_layer = nn_partitioning.remat(
+                DecoderLayer,
+                prevent_cse=False,
+                policy=jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
+                static_argnums=(2,))
+
+            out, _ = nn_partitioning.scan_with_axes(
+                scan_layer,
+                variable_axes={"params": 0},
+                split_rngs={
+                    "params": True,
+                    "dropout": True
+                },
+                in_axes=(nn.broadcast, nn.broadcast),
+                length=self.num_layers,
+                axis_name="layers")(
+                    name="decoder",
+                    hidden_dim=self.hidden_dim,
+                    num_heads=self.num_heads,
+                    mlp_hidden_multiplier=self.mlp_hidden_multiplier,
+                    qkv_dropout=self.qkv_dropout,
+                    msa_dropout=self.msa_dropout,
+                    mlp_dropout=self.mlp_dropout,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
+                    attn_norm_fn=self.attn_norm_fn,
+                    use_scan=self.use_scan,
+                    embedding_init=self.embedding_init,
+                    kernel_init=self.kernel_init,
+                    bias_init=self.bias_init,
+                    ln_scale_init=self.ln_scale_init,
+                )(inputs, decoder_mask, train)
+
+        else:
+            layer_out = inputs
+            for i in range(self.num_layers):
+                layer_out = DecoderLayer(
+                    name=f"layer_{i}",
+                    config=self,
+                )(layer_out, decoder_mask, train)
+            out = layer_out
+
+        ln_out = LayerNorm(
+            name="ln_decoder",
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            scale_init=self.ln_scale_init,
+        )(out)
+
+        if self.shared_embed is None:
+            output = Dense(
+                name="decoder_out_proj",
+                features=(self.vocab_size,),
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                named_axes=("embed", "vocab"))(ln_out)
+        else:
+            output = self.shared_embed.attend(ln_out)
+
+        return output
+
+
+class Transformer(nn.Module):
+    num_layers: int
+    hidden_dim: int
+    num_heads: int
+    mlp_hidden_multiplier: int
+    qkv_dropout: float
+    msa_dropout: float
+    mlp_dropout: float
+    dtype: Dtype
+    param_dtype: Dtype
+    attn_norm_fn: Callable
+    use_scan: bool
+    use_shared_vocab_embed: bool
+    embedding_init: Callable
+    kernel_init: Callable
+    bias_init: Callable
+    ln_scale_init: Callable
+
+    def setup(self):
+        self.vocab_embed = Embed(
+            num_embeddings=self.vocab_size,
+            hidden_dim=self.hidden_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            embedding_init=self.embedding_init)
+
+        self.decoder = Decoder(
+            hidden_dim=self.hidden_dim,
+            num_heads=self.num_heads,
+            mlp_hidden_multiplier=self.mlp_hidden_multiplier,
+            vocab_size=self.vocab_size,
+            qkv_dropout=self.qkv_dropout,
+            msa_dropout=self.msa_dropout,
+            mlp_dropout=self.mlp_dropout,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            attn_norm_fn=self.attn_norm_fn,
+            use_scan=self.use_scan,
+            embedding_init=self.embedding_init,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
+            ln_scale_init=self.ln_scale_init,
+            shared_embd=self.vocab_embed if self.use_shared_vocab_embed else None)
+
+    def decode(self,
+               embeddings: jnp.ndarray,
+               decoder_mask: jnp.ndarray,
+               train: bool):
+        decoder_out = self.decoder(embeddings, decoder_mask, train)
+        return decoder_out
+
+    def __call__(self,
+                 inputs: jnp.ndarray,
+                 decoder_mask: jnp.ndarray,
+                 train: bool):
+        embeddings = self.vocab_embed(inputs)
+        out = self.decode(embeddings, decoder_mask, train)
+        return out

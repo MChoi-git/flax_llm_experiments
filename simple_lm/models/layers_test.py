@@ -1,15 +1,13 @@
 from dataclasses import dataclass
-from typing import Callable
 
+import fiddle as fdl
 import flax.linen.partitioning as nn_partitioning
 import jax
 from jax import numpy as jnp, random
-from jax.experimental import maps
-from jax.experimental.pjit import pjit
 
 import layers
-from layers import Dtype
 import partitioning
+import fiddle_endpoints
 
 
 def _init_test(
@@ -44,197 +42,166 @@ def _init_test(
 
 
 @dataclass(frozen=True)
-class MultiheadAttentionArgs:
-    hidden_dim: int = 8
-    num_heads: int = 2
-    qkv_dropout: float = 0.1
-    msa_dropout: float = 0.1
-    dtype: Dtype = jnp.float32
-    param_dtype: Dtype = jnp.float32
-    attn_norm_fn: Callable = layers.default_attn_norm
-    attn_mask_fn: Callable = layers.make_causal_mask
-    # Input params
+class RotaryPositionEmbedArgs:
     batch_size: int = 2
     seq_len: int = 4
+    num_heads: int = 2
+    hidden_dim: int = 8
+    vocab_size: int = 6969
 
     def __post_init__(self):
         pass
 
     def init_args(self):
         return dict(
-            hidden_dim=self.hidden_dim,
+            batch_size=self.batch_size,
+            seq_len=self.seq_len,
             num_heads=self.num_heads,
-            qkv_dropout=self.qkv_dropout,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            attn_norm_fn=self.attn_norm_fn,
-            attn_mask_fn=self.attn_mask_fn,
-        )
+            hidden_dim=self.hidden_dim,
+            vocab_size=self.vocab_size)
 
     def apply_args(self):
-        inputs = jnp.ones((self.batch_size, self.seq_len, self.hidden_dim))
-        # TODO: Maybe make attention mask an input
-        return {"inputs": inputs, "mask": jnp.zeros(1), "train": False}
+        inputs = random.randint(
+            random.PRNGKey(0),
+            shape=(self.batch_size, self.seq_len, self.num_heads, self.hidden_dim //self.num_heads),
+            minval=0,
+            maxval=6969)
+        return {"inputs": inputs}
 
 
-class MultiheadAttentionTest:
+class RotaryPositionEmbedTest:
     def __init__(self):
-        self.args_cls = MultiheadAttentionArgs()
-        self.module = layers.MultiheadAttention
+        self.args_cls = RotaryPositionEmbedArgs()
+        self.params = self.args_cls.init_args()
+        self.inputs = self.args_cls.apply_args()
 
-        partitioning.init_partitioning_rules()
+    def test_fixed_pos_embed_fn(self):
+        inputs = self.args_cls.apply_args()
+        outputs = layers._fixed_pos_embed(x=inputs["inputs"], seq_dim=1)
+
+        assert map(
+            lambda x: x.shape[0] == (
+                self.params["seq_len"], self.params["hidden_dim"] // self.params["num_heads"] // 2),
+            outputs,
+        )
+
+    def test_rotate_every_two_fn(self):
+        inputs = self.args_cls.apply_args()
+        outputs = layers._rotate_every_two(inputs["inputs"])
+
+        assert outputs.shape == inputs.shape
+
+    def test_apply_rotary_pos_embed_fn(self):
+        inputs = self.args_cls.apply_args()
+        outputs = layers.apply_rotary_pos_embed(inputs["inputs"])
+
+        assert outputs.shape == inputs.shape
+
+
+class BaseTest:
+    def __init__(self, cfg_constructor_fn):
+        self.cfg_constructor_fn = cfg_constructor_fn
+        self.cfg = self.cfg_constructor_fn()
+
+    def make_model(self):
+        return fdl.build(self.cfg)
+
+    def apply_args(self):
+        raise NotImplementedError("Test classes must implemented this")
+
+
+class MultiheadAttentionTest(BaseTest):
+    def __init__(self, cfg_constructor_fn):
+        super().__init__(cfg_constructor_fn)
+
+    def apply_args(self):
+        bsz = 2
+        seq_len = 4
+
+        inputs = jnp.ones((bsz, seq_len, self.cfg.hidden_dim))
+        decoder_mask = layers.make_causal_mask(seq_len, self.cfg.param_dtype)
+
+        return inputs, decoder_mask, False
 
     def test_sharding(self):
         num_gpus = jax.device_count()
         assert num_gpus > 1, "Running sharding test on 1 GPU!"
 
-        init_args = self.args_cls.init_args()
-        apply_args = self.args_cls.apply_args()
+        mesh = partitioning.get_mesh(1, 2, 2, 1)
 
-        (
-            layer,
-            mesh,
-            param_sharding_specs,
-            module_in_sharding_specs,
-            module_out_sharding_specs,
-        ) = _init_test(
-            self.module,
-            init_args,
-            apply_args,
-            ("batch", "seq", "embed"),
-            ("batch", "seq", "embed"),
-        )
+        model = self.make_model()
+        inputs, decoder_mask, train = self.apply_args()
 
-        # pjit `module.apply` and `module.init`
-        pjit_init = pjit(
-            lambda x: layer.init(
-                random.PRNGKey(0), x, apply_args["mask"], apply_args["train"]
-            ),
-            in_axis_resources=module_in_sharding_specs,
-            out_axis_resources=param_sharding_specs,
-        )
-        pjit_apply = pjit(
-            lambda p, x: layer.apply(
-                p, x, apply_args["mask"], apply_args["train"]),
-            in_axis_resources=(param_sharding_specs, module_in_sharding_specs),
-            out_axis_resources=module_in_sharding_specs,
-        )
+        apply_args = (decoder_mask, train)
 
-        # Init params and run forward pass
-        with maps.Mesh(mesh.devices, mesh.axis_names):
-            params = pjit_init(apply_args["inputs"])
-            output = pjit_apply(params, apply_args["inputs"])
+        model = partitioning.PartitionedModel(
+            model=model,
+            rng=random.PRNGKey(0),
+            mesh=mesh,
+            dummy_data=inputs,
+            apply_args=apply_args,
+            module_in_sharding_specs=("batch", "seq", "embed"),
+            module_out_sharding_specs=("batch", "seq", "embed"))
 
-        # Test param and output sharding
-        assert output.device_buffers[0].shape == (
-            self.args_cls.batch_size,
-            self.args_cls.seq_len // num_gpus,
-            self.args_cls.hidden_dim,
-        )
-        assert params["params"]["q_proj"]["kernel"].shape == (
-            self.args_cls.hidden_dim,
-            self.args_cls.num_heads,
-            self.args_cls.hidden_dim // self.args_cls.num_heads,
-        )
-        assert params["params"]["q_proj"]["kernel"].device_buffers[0].shape == (
-            self.args_cls.hidden_dim,
-            self.args_cls.num_heads // 2,
-            self.args_cls.hidden_dim // self.args_cls.num_heads,
-        )
+        params = model.init_model()
+        output = model.forward(params, inputs)
+
+        assert output.device_buffers[0].shape == (2, 4, 8)
 
 
-@dataclass(frozen=True)
-class DecoderLayerArgs:
-    hidden_dim: int = 8
-    num_heads: int = 2
-    mlp_hidden_multiplier: int = 4
-    qkv_dropout: float = 0.1
-    msa_dropout: float = 0.1
-    mlp_dropout: float = 0.1
-    dtype: Dtype = jnp.float32
-    param_dtype: Dtype = jnp.float32
-    attn_norm_fn: Callable = layers.default_attn_norm
-    attn_mask_fn: Callable = layers.make_causal_mask
-    # Input params
-    batch_size: int = 2
-    seq_len: int = 4
-
-    def __post_init__(self):
-        pass
-
-    def init_args(self):
-        return dict(
-            hidden_dim=self.hidden_dim,
-            num_heads=self.num_heads,
-            mlp_hidden_multiplier=self.mlp_hidden_multiplier,
-            qkv_dropout=self.qkv_dropout,
-            msa_dropout=self.msa_dropout,
-            mlp_dropout=self.mlp_dropout,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            attn_norm_fn=self.attn_norm_fn,
-            attn_mask_fn=self.attn_mask_fn,
-        )
+class DecoderTest(BaseTest):
+    def __init__(self, cfg_constructor_fn):
+        super().__init__(cfg_constructor_fn)
 
     def apply_args(self):
-        inputs = jnp.ones((self.batch_size, self.seq_len, self.hidden_dim))
-        # TODO: Maybe make attention mask an input
-        return {"inputs": inputs, "train": False}
+        bsz = 2
+        seq_len = 4
 
+        inputs = jnp.ones((bsz, seq_len, self.cfg.hidden_dim))
+        decoder_mask = layers.make_causal_mask(seq_len, self.cfg.param_dtype)
 
-class DecoderLayerTest:
-    def __init__(self):
-        self.args_cls = DecoderLayerArgs()
-        self.module = layers.DecoderLayer
-
-        partitioning.init_partitioning_rules()
+        return inputs, decoder_mask, False  # pjit can't take kwargs
 
     def test_sharding(self):
         num_gpus = jax.device_count()
         assert num_gpus > 1, "Running sharding test on 1 GPU!"
 
-        init_args = self.args_cls.init_args()
-        apply_args = self.args_cls.apply_args()
+        mesh = partitioning.get_mesh(1, 2, 2, 1)
 
-        (
-            layer,
-            mesh,
-            param_sharding_specs,
-            module_in_sharding_specs,
-            module_out_sharding_specs,
-        ) = _init_test(
-            self.module,
-            init_args,
-            apply_args,
-            ("batch", "seq", "embed"),
-            ("batch", "seq", "embed"),
-        )
+        model = self.make_model()
+        inputs, decoder_mask, train = self.apply_args()
 
-        pjit_init = pjit(
-            lambda x: layer.init(random.PRNGKey(0), x, apply_args["train"]),
-            in_axis_resources=module_in_sharding_specs,
-            out_axis_resources=param_sharding_specs,
-        )
-        pjit_apply = pjit(
-            lambda p, x: layer.apply(p, x, apply_args["train"]),
-            in_axis_resources=(param_sharding_specs, module_in_sharding_specs),
-            out_axis_resources=module_out_sharding_specs,
-        )
+        apply_args = (decoder_mask, train)
 
-        # Init params and run forward pass
-        with maps.Mesh(mesh.devices, mesh.axis_names):
-            params = pjit_init(apply_args["inputs"])
-            output = pjit_apply(params, apply_args["inputs"])
+        model = partitioning.PartitionedModel(
+            model=model,
+            rng=random.PRNGKey(0),
+            mesh=mesh,
+            dummy_data=inputs,
+            apply_args=apply_args,
+            module_in_sharding_specs=("batch", "seq", "embed"),
+            module_out_sharding_specs=("batch", "seq", "vocab"))
 
-        # TODO: Add tests
-        assert output.device_buffers[0].shape == (2, 2, 8)
+        params = model.init_model()
+        output = model.forward(params, inputs)
+
+        assert output.device_buffers[0].shape == (2, 4, 50000)
 
 
 def main():
-    self_attention_test = MultiheadAttentionTest()
+    self_attention_test = MultiheadAttentionTest(fiddle_endpoints.make_test_multihead_attention)
     self_attention_test.test_sharding()
-    decoder_layer_test = DecoderLayerTest()
-    decoder_layer_test.test_sharding()
+    print("MultiheadAttention test passed")
+    decoder_test = DecoderTest(fiddle_endpoints.make_test_decoder)
+    decoder_test.test_sharding()
+    print("Decoder test passed")
+    """
+    rotary_embed_test = RotaryPositionEmbedTest()
+    rotary_embed_test.test_fixed_pos_embed_fn()
+    rotary_embed_test.test_rotate_every_two_fn()
+    rotary_embed_test.test_apply_rotary_pos_embed()
+    print("Rotary embeddings test passed")
+    """
 
 
 if __name__ == "__main__":
