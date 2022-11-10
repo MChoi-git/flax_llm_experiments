@@ -326,7 +326,7 @@ class Embed(nn.Module):
             raise ValueError("Input type must be an integer type")
 
         embedding = promote_dtype(
-            self.embedding, dtype=self.dtype, inexact=False)
+            self.embedding, dtype=self.dtype, inexact=False)[0]
 
         return jnp.take(embedding, inputs, axis=0)
 
@@ -550,6 +550,7 @@ class Transformer(nn.Module):
     hidden_dim: int
     num_heads: int
     mlp_hidden_multiplier: int
+    vocab_size: int
     qkv_dropout: float
     msa_dropout: float
     mlp_dropout: float
@@ -572,6 +573,7 @@ class Transformer(nn.Module):
             embedding_init=self.embedding_init)
 
         self.decoder = Decoder(
+            num_layers=self.num_layers,
             hidden_dim=self.hidden_dim,
             num_heads=self.num_heads,
             mlp_hidden_multiplier=self.mlp_hidden_multiplier,
@@ -587,7 +589,7 @@ class Transformer(nn.Module):
             kernel_init=self.kernel_init,
             bias_init=self.bias_init,
             ln_scale_init=self.ln_scale_init,
-            shared_embd=self.vocab_embed if self.use_shared_vocab_embed else None)
+            shared_embed=self.vocab_embed if self.use_shared_vocab_embed else None)
 
     def decode(self,
                embeddings: jnp.ndarray,

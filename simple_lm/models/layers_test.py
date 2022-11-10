@@ -107,7 +107,7 @@ class BaseTest:
         return fdl.build(self.cfg)
 
     def apply_args(self):
-        raise NotImplementedError("Test classes must implemented this")
+        raise NotImplementedError("Test classes must implement this")
 
 
 class MultiheadAttentionTest(BaseTest):
@@ -188,6 +188,45 @@ class DecoderTest(BaseTest):
         assert output.device_buffers[0].shape == (2, 4, 50000)
 
 
+class TransformerTest(BaseTest):
+    def __init__(self, cfg_constructor_fn):
+        super().__init__(cfg_constructor_fn)
+
+    def apply_args(self):
+        bsz = 2
+        seq_len = 4
+        inputs = random.randint(
+            random.PRNGKey(0), minval=0, maxval=50000, shape=(bsz, seq_len))
+        decoder_mask = layers.make_causal_mask(seq_len, self.cfg.param_dtype)
+
+        return inputs, decoder_mask, False
+
+    def test_sharding(self):
+        num_gpus = jax.device_count()
+        assert num_gpus > 1, "Running sharding test on 1 GPU!"
+
+        mesh = partitioning.get_mesh(1, 2, 2, 1)
+
+        model = self.make_model()
+        inputs, decoder_mask, train = self.apply_args()
+
+        apply_args = (decoder_mask, train)
+
+        model = partitioning.PartitionedModel(
+            model=model,
+            rng=random.PRNGKey(0),
+            mesh=mesh,
+            dummy_data=inputs,
+            apply_args=apply_args,
+            module_in_sharding_specs=("batch", "seq"),
+            module_out_sharding_specs=("batch", "seq", "vocab"))
+
+        params = model.init_model()
+        output = model.forward(params, inputs)
+
+        assert output.device_buffers[0].shape == (2, 4, 50000)
+
+
 def main():
     self_attention_test = MultiheadAttentionTest(fiddle_endpoints.make_test_multihead_attention)
     self_attention_test.test_sharding()
@@ -195,6 +234,9 @@ def main():
     decoder_test = DecoderTest(fiddle_endpoints.make_test_decoder)
     decoder_test.test_sharding()
     print("Decoder test passed")
+    transformer_test = TransformerTest(fiddle_endpoints.make_test_transformer)
+    transformer_test.test_sharding()
+    print("Transformer test passed")
     """
     rotary_embed_test = RotaryPositionEmbedTest()
     rotary_embed_test.test_fixed_pos_embed_fn()
