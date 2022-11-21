@@ -53,7 +53,7 @@ def init_partitioning_rules(override_rules=()) -> None:
 def construct_module_sharding_spec(module, dummy_data, *apply_args):
     """
     Initialize a model with some dummy initialization and apply args, then
-    return its
+    return a pytree of its parameter sharding specs.
     """
     params = module.init(random.PRNGKey(0), dummy_data, *apply_args)
 
@@ -94,42 +94,37 @@ def with_sharding_constraint(x, axis_resources):
 class PartitionedModel:
     def __init__(self,
                  model,
-                 rng,
                  mesh,
-                 dummy_data,
-                 apply_args,
                  module_in_sharding_specs,
                  module_out_sharding_specs):
         self.model = model
-        self.rng = rng
         self.mesh = mesh
-        self.dummy_data = dummy_data
 
         # Make module IO and parameter sharding specs
         self.module_in_sharding_specs = nn_partitioning.logical_to_mesh_axes(
             module_in_sharding_specs)
         self.module_out_sharding_specs = nn_partitioning.logical_to_mesh_axes(
             module_out_sharding_specs)
-        self.param_sharding_specs = construct_module_sharding_spec(
-            model, self.dummy_data, *apply_args)
 
-        self.rng, init_rng = random.split(self.rng)
+        self.param_sharding_specs = None
 
-        self.pjit_init_fn = pjit(
-            lambda x: self.model.init(init_rng, x, *apply_args),
-            in_axis_resources=self.module_in_sharding_specs,
-            out_axis_resources=self.param_sharding_specs)
+    def init(self, rng, dummy_data, *args, **kwargs):
+        if self.param_sharding_specs is None:
+            self.param_sharding_specs = construct_module_sharding_spec(
+                self.model, dummy_data, *args, **kwargs)
 
-        self.pjit_apply_fn = pjit(
-            lambda p, x: self.model.apply(p, x, *apply_args),
-            in_axis_resources=(
-                self.param_sharding_specs, self.module_in_sharding_specs),
-            out_axis_resources=self.module_out_sharding_specs)
-
-    def init_model(self):
         with maps.Mesh(self.mesh.devices, self.mesh.axis_names):
-            return self.pjit_init_fn(self.dummy_data)
+            return pjit(
+                lambda x: self.model.init(rng, x, *args, **kwargs),
+                in_axis_resources=self.module_in_sharding_specs,
+                out_axis_resources=self.param_sharding_specs,
+            )(dummy_data)
 
-    def forward(self, params, batch: jnp.ndarray):
+    def apply(self, params, batch: jnp.ndarray, *args, **kwargs):
         with maps.Mesh(self.mesh.devices, self.mesh.axis_names):
-            return self.pjit_apply_fn(params, batch)
+            return pjit(
+                lambda p, x: self.model.apply(p, x, *args, **kwargs),
+                in_axis_resources=(
+                    self.param_sharding_specs, self.module_in_sharding_specs),
+                out_axis_resources=self.module_out_sharding_specs,
+            )(params, batch)

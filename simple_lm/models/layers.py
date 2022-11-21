@@ -25,9 +25,9 @@ purposes.
 Dtype = Any
 
 
-def make_causal_mask(seq_len: int, param_dtype: Dtype):
+def make_causal_mask(seq_len: int, dtype: Dtype):
     mask = jnp.triu(
-        jnp.zeros((seq_len, seq_len), dtype=param_dtype) - jnp.inf, k=1)
+        jnp.zeros((seq_len, seq_len), dtype=dtype) - jnp.inf, k=1)
     return mask
 
 
@@ -178,7 +178,7 @@ def dot_product_attention(
     value: jnp.ndarray,
     mask: Optional[jnp.ndarray],
     deterministic: bool,
-    qkv_dropout: float,
+    #qkv_dropout: float,
     dropout_rng: jnp.ndarray,
     norm_fn: Callable,
 ):
@@ -251,9 +251,9 @@ class MultiheadAttention(nn.Module):
         k = apply_rotary_pos_embed(k, seq_dim=1)
         k = with_sharding_constraint(k, ("batch", "seq", "heads", "kv"))
 
-        dropout_rng = (
-            self.make_rng("dropout") if train and self.qkv_dropout > 0.0 else None
-        )
+        #dropout_rng = (
+        #    self.make_rng("dropout") if train and self.qkv_dropout > 0.0 else None
+        #)
 
         self_attn = dot_product_attention(
             q,
@@ -262,7 +262,7 @@ class MultiheadAttention(nn.Module):
             mask,
             train,
             self.qkv_dropout,
-            dropout_rng,
+            #dropout_rng,
             partial(default_attn_norm, hidden_dim=self.hidden_dim),
         )
         self_attn = with_sharding_constraint(

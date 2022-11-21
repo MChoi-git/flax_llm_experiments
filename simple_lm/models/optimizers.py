@@ -9,32 +9,15 @@ import optax
 from layers import Dtype
 
 
-class BasePartitionedOptimizer:
-    def __init__(self, param_sharding_specs, mesh, optim_fn, *args):
+class PartitionedOptim:
+    def __init__(self,
+                 optim,
+                 mesh,
+                 param_sharding_specs):
         self.param_sharding_specs = param_sharding_specs
         self.mesh = mesh
-        self.optim = optim_fn(*args)
+        self.optim = optim
 
-    def init(self, params):
-        raise NotImplementedError("Optimizer classes must implement this")
-
-    def update(self, grads, optim_state, params):
-        raise NotImplementedError("Optimizer classes must implement this")
-
-
-class PartitionedAdam(BasePartitionedOptimizer):
-    def __init__(self,
-                 param_sharding_specs,  # Pytree
-                 mesh,
-                 b1: float,
-                 b2: float,
-                 eps_root: float,
-                 mu_dtype: Optional[Dtype] = jnp.float32):
-        self.hparams = (b1, b2, eps_root, mu_dtype)
-        super().__init__(param_sharding_specs,
-                         mesh,
-                         optax._src.transform.scale_by_adam,
-                         self.hparams)
         self.optim_state_sharding_spec = optax._src.transform.ScaleByAdamState(
             None,                       # count
             self.param_sharding_specs,  # mu
@@ -42,23 +25,33 @@ class PartitionedAdam(BasePartitionedOptimizer):
 
         self.pjit_init_fn = pjit(
             lambda p: self.optim.init(p),
-            in_axis_resources=self.param_sharding_specs,
-            out_axis_resources=self.optim_state_sharding_spec)
+            in_axis_resources=(self.param_sharding_specs,),
+            out_axis_resources=(self.optim_state_sharding_spec, None))
 
         self.pjit_update_fn = pjit(
-            lambda g, s, p: self.optim.update(g, s, p),
+            lambda g, s: self.optim.update(g, s),
             in_axis_resources=(
                 self.param_sharding_specs,
-                self.param_sharding_specs,
-                self.param_sharding_specs),
+                (self.optim_state_sharding_spec, None)),
             out_axis_resources=(
                 self.param_sharding_specs,
-                self.optim_state_sharding_spec))
+                (self.optim_state_sharding_spec, None)))
+
+        self.pjit_apply_updates_fn = pjit(
+            lambda p, u: optax.apply_updates(p, u),
+            in_axis_resources=(
+                self.param_sharding_specs,
+                self.param_sharding_specs),
+            out_axis_resources=self.param_sharding_specs)
 
     def init(self, params):
         with maps.Mesh(self.mesh.devices, self.mesh.axis_names):
             return self.pjit_init_fn(params)
 
-    def update(self, grads, optim_state, params):
-        with maps.Mesh(self.mesh.devices, self.mesh_axis_names):
-            return self.pjit_udpate_fn(grads, optim_state, params)
+    def update(self, grads, optim_state):
+        with maps.Mesh(self.mesh.devices, self.mesh.axis_names):
+            return self.pjit_update_fn(grads, optim_state)
+
+    def apply_updates(self, params, updates):
+        with maps.Mesh(self.mesh.devices, self.mesh.axis_names):
+            return self.pjit_apply_updates_fn(params, updates)

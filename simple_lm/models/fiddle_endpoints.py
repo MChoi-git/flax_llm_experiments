@@ -1,9 +1,11 @@
 import flax.linen.initializers as nn_initializers
 import jax
-import jax.numpy as jnp
+from jax import numpy as jnp, random
 import fiddle as fdl
 
 import layers
+import optax
+import datasets
 
 
 def make_test_multihead_attention():
@@ -28,7 +30,7 @@ def make_test_decoder():
         hidden_dim=8,
         num_heads=2,
         mlp_hidden_multiplier=4,
-        vocab_size=50000,
+        vocab_size=50,
         qkv_dropout=0.1,
         msa_dropout=0.1,
         mlp_dropout=0.1,
@@ -50,11 +52,11 @@ def make_test_transformer():
     """Construct a Transformer class."""
     transformer = fdl.Config(
         layers.Transformer,
-        num_layers=16,
+        num_layers=2,
         hidden_dim=8,
         num_heads=2,
         mlp_hidden_multiplier=4,
-        vocab_size=50000,
+        vocab_size=50,
         qkv_dropout=0.1,
         msa_dropout=0.1,
         mlp_dropout=0.1,
@@ -68,6 +70,30 @@ def make_test_transformer():
         kernel_init=jax.nn.initializers.lecun_normal(),
         bias_init=jax.nn.initializers.zeros,
         ln_scale_init=jax.nn.initializers.ones,
-
     )
     return transformer
+
+
+def make_test_synth_dataset():
+    dataset = fdl.Config(
+        datasets.DummyDataset,
+        rng=random.PRNGKey(1),
+        num_examples=1,
+        batch_size=2,
+        unbatched_shape=(4,),
+        vocab_size=50,
+        dtype=jnp.int32,
+    )
+    return dataset
+
+
+def make_test_optimizer():
+    optim = fdl.Config(
+        optax.adam,
+        learning_rate=1e-1,
+        b1=0.9,
+        b2=0.999,
+        eps_root=1e-6,
+        mu_dtype=jnp.float32,
+    )
+    return optim

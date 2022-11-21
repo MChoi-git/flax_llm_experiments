@@ -10,37 +10,6 @@ import partitioning
 import fiddle_endpoints
 
 
-def _init_test(
-    module,
-    init_args,
-    apply_args,
-    in_sharding_spec,
-    out_sharding_spec
-):
-    # initialize layer to test
-    sa_layer = module(**init_args)
-
-    # get device mesh for pjit
-    mesh = partitioning.get_mesh(1, 2, 2, 1)
-
-    param_sharding_specs = partitioning.construct_module_sharding_spec(
-        module, init_args, apply_args
-    )
-
-    module_in_sharding_specs = nn_partitioning.logical_to_mesh_axes(
-        in_sharding_spec)
-    module_out_sharding_specs = nn_partitioning.logical_to_mesh_axes(
-        out_sharding_spec)
-
-    return (
-        sa_layer,
-        mesh,
-        param_sharding_specs,
-        module_in_sharding_specs,
-        module_out_sharding_specs,
-    )
-
-
 @dataclass(frozen=True)
 class RotaryPositionEmbedArgs:
     batch_size: int = 2
@@ -136,15 +105,12 @@ class MultiheadAttentionTest(BaseTest):
 
         model = partitioning.PartitionedModel(
             model=model,
-            rng=random.PRNGKey(0),
             mesh=mesh,
-            dummy_data=inputs,
-            apply_args=apply_args,
             module_in_sharding_specs=("batch", "seq", "embed"),
             module_out_sharding_specs=("batch", "seq", "embed"))
 
-        params = model.init_model()
-        output = model.forward(params, inputs)
+        params = model.init(random.PRNGKey(0), inputs, *apply_args)
+        output = model.apply(params, inputs, *apply_args)
 
         assert output.device_buffers[0].shape == (2, 4, 8)
 
@@ -175,17 +141,14 @@ class DecoderTest(BaseTest):
 
         model = partitioning.PartitionedModel(
             model=model,
-            rng=random.PRNGKey(0),
             mesh=mesh,
-            dummy_data=inputs,
-            apply_args=apply_args,
             module_in_sharding_specs=("batch", "seq", "embed"),
             module_out_sharding_specs=("batch", "seq", "vocab"))
 
-        params = model.init_model()
-        output = model.forward(params, inputs)
+        params = model.init(random.PRNGKey(0), inputs, *apply_args)
+        output = model.apply(params, inputs, *apply_args)
 
-        assert output.device_buffers[0].shape == (2, 4, 50000)
+        assert output.device_buffers[0].shape == (2, 4, 50)
 
 
 class TransformerTest(BaseTest):
@@ -196,7 +159,7 @@ class TransformerTest(BaseTest):
         bsz = 2
         seq_len = 4
         inputs = random.randint(
-            random.PRNGKey(0), minval=0, maxval=50000, shape=(bsz, seq_len))
+            random.PRNGKey(0), minval=0, maxval=50, shape=(bsz, seq_len))
         decoder_mask = layers.make_causal_mask(seq_len, self.cfg.param_dtype)
 
         return inputs, decoder_mask, False
@@ -214,21 +177,19 @@ class TransformerTest(BaseTest):
 
         model = partitioning.PartitionedModel(
             model=model,
-            rng=random.PRNGKey(0),
             mesh=mesh,
-            dummy_data=inputs,
-            apply_args=apply_args,
             module_in_sharding_specs=("batch", "seq"),
             module_out_sharding_specs=("batch", "seq", "vocab"))
 
-        params = model.init_model()
-        output = model.forward(params, inputs)
+        params = model.init(random.PRNGKey(0), inputs, *apply_args)
+        output = model.apply(params, inputs, *apply_args)
 
-        assert output.device_buffers[0].shape == (2, 4, 50000)
+        assert output.device_buffers[0].shape == (2, 4, 50)
 
 
 def main():
-    self_attention_test = MultiheadAttentionTest(fiddle_endpoints.make_test_multihead_attention)
+    self_attention_test = MultiheadAttentionTest(
+        fiddle_endpoints.make_test_multihead_attention)
     self_attention_test.test_sharding()
     print("MultiheadAttention test passed")
     decoder_test = DecoderTest(fiddle_endpoints.make_test_decoder)
