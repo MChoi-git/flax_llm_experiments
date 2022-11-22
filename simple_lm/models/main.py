@@ -8,10 +8,11 @@ from tasks import TrainTask
 
 
 def main():
+    BSZ = 2
     SEQ_LEN = 4
 
     dummy_data = jnp.ones(
-        (2, 4),
+        (BSZ, SEQ_LEN),
         dtype=jnp.int32)
 
     num_gpus = jax.device_count()
@@ -30,6 +31,7 @@ def main():
     decoder_mask = layers.make_causal_mask(SEQ_LEN, dtype=jnp.float32)
     init_args = (decoder_mask, False)
     apply_args = (decoder_mask, True)
+    loss_fn_kwargs = {"z_loss": 10e-4}
 
     # TODO: Include module sharding specs in fiddle configs
     model, optim, dataset = task.setup(
@@ -44,10 +46,12 @@ def main():
         dataset,
         rng,
         dummy_data,
-        num_epochs=10,
+        num_epochs=100,
         max_tokens=10000000,
         init_args=init_args,
-        apply_args=apply_args)
+        apply_args=apply_args,
+        loss_fn_kwargs=loss_fn_kwargs,
+    )
 
 
 if __name__ == "__main__":
