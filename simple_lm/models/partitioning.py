@@ -3,11 +3,26 @@ import flax.linen.partitioning as nn_partitioning
 import jax
 from jax import random, numpy as jnp
 from jax.experimental import maps
-from jax.experimental.pjit import with_sharding_constraint as _with_sharding_constraint, pjit
+from jax.experimental.pjit import (
+    with_sharding_constraint as _with_sharding_constraint,
+    pjit,
+)
 import numpy as np
 
 
 GPUS_PER_NODE = 4
+
+
+DEFAULT_RULES = {
+    "batch": None,
+    "heads": "mp",
+    "embed": None,
+    "mlp": "mp",
+    "joined_kv": "mp",
+    "kv": None,
+    "seq": None,    # TODO: Can we use sequence parallel?
+    "vocab": "mp",
+}
 
 
 def get_mesh(num_nodes, gpus_per_node, mp_size, dp_size):
@@ -25,18 +40,6 @@ def get_mesh(num_nodes, gpus_per_node, mp_size, dp_size):
     mesh = maps.Mesh(devices, ("dp", "mp"))
 
     return mesh
-
-
-DEFAULT_RULES = {
-    "batch": None,
-    "heads": "mp",
-    "embed": None,
-    "mlp": "mp",
-    "joined_kv": "mp",
-    "kv": None,
-    "seq": None,    # TODO: Can we use sequence parallel?
-    "vocab": "mp",
-}
 
 
 def init_partitioning_rules(override_rules=()) -> None:
@@ -97,6 +100,12 @@ class PartitionedModel:
                  mesh,
                  module_in_sharding_specs,
                  module_out_sharding_specs):
+        """
+        Wrapper over some nn.Module that contains sharding utility. The init
+        and apply methods are proxied so that in and out sharding specs for
+        parameters and module IO can be applied to a pjit version of the same
+        methods.
+        """
         self.model = model
         self.mesh = mesh
 

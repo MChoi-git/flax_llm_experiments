@@ -76,6 +76,19 @@ def make_test_transformer():
 
 def make_test_synth_dataset():
     dataset = fdl.Config(
+        datasets.SyntheticDataset,
+        rng=random.PRNGKey(1),
+        num_examples=1,
+        batch_size=2,
+        unbatched_shape=(4,),
+        vocab_size=50,
+        dtype=jnp.int32,
+    )
+    return dataset
+
+
+def make_test_dummy_dataset():
+    dataset = fdl.Config(
         datasets.DummyDataset,
         rng=random.PRNGKey(1),
         num_examples=1,

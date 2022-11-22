@@ -5,11 +5,8 @@ import fiddle as fdl
 import jax
 from jax import numpy as jnp, random
 
-import fiddle_endpoints
 import partitioning
-import layers
 import optimizers
-import datasets
 import losses
 
 
@@ -43,7 +40,12 @@ class TrainTask(BaseTask):
             shift=1,
             axis=-1)[:, :-1]
 
-    def make_partitioned_model(self, mesh, module_in_sharding_specs, module_out_sharding_specs):
+    def make_partitioned_model(
+        self,
+        mesh,
+        module_in_sharding_specs,
+        module_out_sharding_specs
+    ):
         model = self.make_model()
         return partitioning.PartitionedModel(
             model,
@@ -83,14 +85,11 @@ class TrainTask(BaseTask):
         params = model.init(init_rng, dummy_data, *init_args)
         optim_state = optim.init(params)
 
-        def generic_loss_fn(params, batch, targets, tgt_loss_fn, apply_rngs, loss_fn_kwargs={}):
-            logits = model.apply(params, batch, *apply_args, rngs=apply_rngs)
-            loss = tgt_loss_fn(logits, targets, **loss_fn_kwargs)
-            return jnp.mean(loss)
-
         loss_fn = functools.partial(
-            generic_loss_fn,
+            losses.generic_loss_fn,
+            model=model,
             tgt_loss_fn=losses.stable_cross_entropy_loss_with_logits,
+            apply_args=apply_args,
         )
 
         dataset_generator = iter(dataset)
@@ -113,41 +112,3 @@ class TrainTask(BaseTask):
             params = optim.apply_updates(params, updates)
 
             print(f"Loss at epoch {i}: {loss}")
-
-
-SEQ_LEN = 4
-
-dummy_data = jnp.ones(
-    (2, 4),
-    dtype=jnp.int32)
-
-num_gpus = jax.device_count()
-mesh = partitioning.get_mesh(1, 2, 2, 1)
-
-task = TrainTask(
-    fiddle_endpoints.make_test_transformer,
-    fiddle_endpoints.make_test_synth_dataset,
-    fiddle_endpoints.make_test_optimizer,
-)
-
-decoder_mask = layers.make_causal_mask(SEQ_LEN, dtype=jnp.float32)
-init_args = (decoder_mask, False)
-apply_args = (decoder_mask, True)
-
-# TODO: Include module sharding specs in fiddle configs
-model, optim, dataset = task.setup(
-    mesh=mesh,
-    module_in_sharding_specs=("batch", "seq"),
-    module_out_sharding_specs=("batch", "seq", "vocab"))
-
-rng = random.PRNGKey(0)
-task.train(
-    model,
-    optim,
-    dataset,
-    rng,
-    dummy_data,
-    num_epochs=10,
-    max_tokens=10000000,
-    init_args=init_args,
-    apply_args=apply_args)

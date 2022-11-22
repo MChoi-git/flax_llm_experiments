@@ -5,7 +5,7 @@ from typing import Any, Optional, Callable, Tuple, Union
 import einops
 import numpy as np
 import jax
-from jax import numpy as jnp
+from jax import numpy as jnp, random
 import flax.linen as nn
 import flax.linen.initializers as nn_initializers
 from flax.linen.dtypes import promote_dtype
@@ -178,7 +178,7 @@ def dot_product_attention(
     value: jnp.ndarray,
     mask: Optional[jnp.ndarray],
     deterministic: bool,
-    #qkv_dropout: float,
+    qkv_dropout: float,
     dropout_rng: jnp.ndarray,
     norm_fn: Callable,
 ):
@@ -192,6 +192,23 @@ def dot_product_attention(
     attn_weights = jax.nn.softmax(norm_fn(qk + mask), axis=-1)
 
     # TODO: qkv dropout not implemented yet
+
+    def _dropout(inputs, rate):
+        """Dropout impl taken from flax source."""
+        if deterministic or rate == 0.:
+            return inputs
+
+        if rate == 1.:
+            return jnp.zeros_like(inputs)
+
+        keep_prob = 1. - rate
+        mask_shape = inputs.shape
+
+        # Don't broadcast, inputs are always same shape
+        mask = random.bernoulli(dropout_rng, p=keep_prob, shape=mask_shape)
+        return jax.lax.select(mask, inputs / keep_prob, jnp.zeros_like(inputs))
+
+    attn_weights = _dropout(attn_weights, rate=qkv_dropout)
 
     self_attn = jnp.einsum("bhsS,bShe->bshe", attn_weights, value)
 
@@ -251,19 +268,21 @@ class MultiheadAttention(nn.Module):
         k = apply_rotary_pos_embed(k, seq_dim=1)
         k = with_sharding_constraint(k, ("batch", "seq", "heads", "kv"))
 
-        #dropout_rng = (
-        #    self.make_rng("dropout") if train and self.qkv_dropout > 0.0 else None
-        #)
+        dropout_rng = (
+            self.make_rng("dropout")
+            if train and self.qkv_dropout > 0.0
+            else None
+        )
 
         self_attn = dot_product_attention(
-            q,
-            k,
-            v,
-            mask,
-            train,
-            self.qkv_dropout,
-            #dropout_rng,
-            partial(default_attn_norm, hidden_dim=self.hidden_dim),
+            query=q,
+            key=k,
+            value=v,
+            mask=mask,
+            deterministic=not train,
+            qkv_dropout=self.qkv_dropout,
+            dropout_rng=dropout_rng,
+            norm_fn=partial(default_attn_norm, hidden_dim=self.hidden_dim),
         )
         self_attn = with_sharding_constraint(
             self_attn, ("batch", "seq", "heads", "kv"))

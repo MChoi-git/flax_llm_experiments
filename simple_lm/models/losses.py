@@ -1,6 +1,20 @@
-import einops
 import jax
-from jax import numpy as jnp, random
+from jax import numpy as jnp
+
+
+def generic_loss_fn(
+    params,
+    batch,
+    targets,
+    apply_rngs,
+    model,
+    tgt_loss_fn,
+    apply_args,
+    loss_fn_kwargs={}
+):
+    logits = model.apply(params, batch, *apply_args, rngs=apply_rngs)
+    loss = tgt_loss_fn(logits, targets, **loss_fn_kwargs)
+    return jnp.mean(loss)
 
 
 def log_softmax(logits, axis=-1):
